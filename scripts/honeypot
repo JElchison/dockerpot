@@ -1,51 +1,64 @@
 #!/bin/bash
 
-EXT_IFACE=eth0
-MEM_LIMIT=128M
-SERVICE=22
-
-QUOTA_IN=5242880
-QUOTA_OUT=1310720
-
 {
-    CNM="honeypot-${REMOTE_HOST}"
+    set -ex
+
+    EXT_IFACE=eth0
+    XINETD_LISTEN_PORT=22
     HOSTNAME=$(/bin/hostname)
 
+    MEM_LIMIT=128M
+    QUOTA_IN=5242880
+    QUOTA_OUT=1310720
+
+    # fix REMOTE_HOST to only contain IP address
+    REMOTE_HOST=${REMOTE_HOST//::ffff:/}
+    export REMOTE_HOST
+
+    IMAGE_NAME=honeypot
+    CNM="${IMAGE_NAME}-${REMOTE_HOST}"
+
+    # avoid locale assertion with nsenter
+    export LC_ALL=C
+
     # check if the container exists
-    if ! /usr/bin/docker inspect "${CNM}" &> /dev/null; then
-	# create new container
-        CID=$(/usr/bin/docker run --name ${CNM} -h ${HOSTNAME} -e "REMOTE_HOST=${REMOTE_HOST}" -m ${MEM_LIMIT} -d -i honeypot /sbin/init)
-	CIP=$(/usr/bin/docker inspect --format '{{ .NetworkSettings.IPAddress }}' ${CID})
-        PID=$(/usr/bin/docker inspect --format '{{ .State.Pid }}' ${CID})
-	
-	# drop all inbound and outbound traffic by default
-        /usr/bin/nsenter --target ${PID} -n /sbin/iptables -P INPUT DROP
-        /usr/bin/nsenter --target ${PID} -n /sbin/iptables -P OUTPUT DROP
+    if ! docker inspect "${CNM}" &> /dev/null; then
+        # create new container
+        CID=$(docker run --name "${CNM}" -h "${HOSTNAME}" -e "REMOTE_HOST=${REMOTE_HOST}" -m ${MEM_LIMIT} -d ${IMAGE_NAME})
+        CIP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' "${CID}")
+        PID=$(docker inspect --format '{{ .State.Pid }}' "${CID}")
 
-	# allow access to the service regardless of the quota
-        /usr/bin/nsenter --target ${PID} -n /sbin/iptables -A INPUT -p tcp -m tcp --dport ${SERVICE} -j ACCEPT
-        /usr/bin/nsenter --target ${PID} -n /sbin/iptables -A INPUT -m quota --quota ${QUOTA_IN} -j ACCEPT
+        # drop all inbound and outbound traffic by default
+        nsenter --target "${PID}" -n iptables -P INPUT DROP
+        nsenter --target "${PID}" -n iptables -P OUTPUT DROP
 
-	# allow related outbound access limited by the quota
-        /usr/bin/nsenter --target ${PID} -n /sbin/iptables -A OUTPUT -p tcp --sport ${SERVICE} -m state --state ESTABLISHED,RELATED -m quota --quota ${QUOTA_OUT} -j ACCEPT
+        # allow access to the service regardless of the quota
+        nsenter --target "${PID}" -n iptables -A INPUT -p tcp -m tcp --dport ${XINETD_LISTEN_PORT} -j ACCEPT
+        nsenter --target "${PID}" -n iptables -A INPUT -m quota --quota ${QUOTA_IN} -j ACCEPT
 
-	# enable the host to connect to rsyslog on the host
-        /usr/bin/nsenter --target ${PID} -n /sbin/iptables -A OUTPUT -p tcp -m tcp --dst 172.17.42.1 --dport 514 -j ACCEPT
+        # allow related outbound access limited by the quota
+        nsenter --target "${PID}" -n iptables -A OUTPUT -p tcp --sport ${XINETD_LISTEN_PORT} -m state --state ESTABLISHED,RELATED -m quota --quota ${QUOTA_OUT} -j ACCEPT
 
-	# add iptables redirection rule
-	/usr/bin/iptables -t nat -A PREROUTING -i ${EXT_IFACE} -s ${$REMOTE_HOST} ! --dport ${SERVICE} -j DNAT --to-destination ${CIP}
-	/usr/bin/iptables -t nat -A POSTROUTING -j MASQUERADE
+        # enable the host to connect to rsyslog on the host
+        #nsenter --target "${PID}" -n iptables -A OUTPUT -p tcp -m tcp --dst 172.17.42.1 --dport 514 -j ACCEPT
+
+        # add iptables redirection rule
+        iptables -t nat -A PREROUTING -i ${EXT_IFACE} -s "${REMOTE_HOST}" -p tcp -m tcp ! --dport ${XINETD_LISTEN_PORT} -j DNAT --to-destination "${CIP}"
+        iptables -t nat -A POSTROUTING -j MASQUERADE
     else
-	# start container if exited and grab the cid
-        /usr/bin/docker start "${CNM}" &> /dev/null
-        CID=$(/usr/bin/docker inspect --format '{{ .Id }}' "${CNM}")
-	CIP=$(/usr/bin/docker inspect --format '{{ .NetworkSettings.IPAddress }}' ${CID})
+        # start container if exited and grab the cid
+        docker start "${CNM}" &> /dev/null
+        CID=$(docker inspect --format '{{ .Id }}' "${CNM}")
+        CIP=$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' "${CID}")
 
-	# add iptables redirection rule
-	/usr/bin/iptables -t nat -A PREROUTING -i ${EXT_IFACE} -s ${$REMOTE_HOST} ! --dport ${SERVICE} -j DNAT --to-destination ${CIP}
-	/usr/bin/iptables -t nat -A POSTROUTING -j MASQUERADE
+        # add iptables redirection rule
+        iptables -t nat -A PREROUTING -i ${EXT_IFACE} -s "${REMOTE_HOST}" -p tcp -m tcp ! --dport ${XINETD_LISTEN_PORT} -j DNAT --to-destination "${CIP}"
+        iptables -t nat -A POSTROUTING -j MASQUERADE
     fi
-} &> /dev/null
+
+    set +x
+} &> /var/log/honeypot
 
 # forward traffic to the container
-exec /usr/bin/socat stdin tcp:${CIP}:22,retry=60
+exec socat stdin tcp:"${CIP}":${XINETD_LISTEN_PORT},retry=60
+
