@@ -29,7 +29,8 @@
 
         RUNNING=$(docker inspect --format '{{ .State.Running }}' "${CID}")
         if [[ "$RUNNING" != "true" ]]; then
-            # delete iptables rule
+            # delete iptables rules
+            iptables -t nat -D POSTROUTING -j MASQUERADE
             iptables -t nat -D PREROUTING -i ${EXT_IFACE} -s "${REMOTE_HOST}" -p tcp -m tcp ! --dport ${XINETD_LISTEN_PORT} -j DNAT --to-destination "${CIP}"
             logger -p local3.info "Removing ${IMAGE_NAME} container ${CID}"
             docker rm "$CID"
